@@ -12,7 +12,8 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { copyFile, link, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { setTimeout as wait } from 'node:timers/promises'
 
@@ -98,6 +99,9 @@ export async function writeFileAtomic(filename: string, content: string | Uint8A
 async function isLockContention(error: unknown, lockPath: string): Promise<boolean> {
   const code = (error as NodeJS.ErrnoException | null)?.code
   if (code === 'EEXIST') return true
+  // A transient shortage (the process's descriptor table, a Windows sharing violation) says nothing
+  // about a holder: retry it on the contention cadence instead of failing the write outright.
+  if (code === 'EMFILE' || code === 'ENFILE' || code === 'EBUSY') return true
   if (code !== 'EPERM') return false
   try {
     await lstat(lockPath)
@@ -105,6 +109,27 @@ async function isLockContention(error: unknown, lockPath: string): Promise<boole
   } catch {
     // Keep the original EPERM authoritative when lock existence is unproven.
     return false
+  }
+}
+
+/**
+ * Publish the lock with its record already inside it. A `<pid>\n` sibling is written first and then
+ * hard-linked onto the lock path: `EEXIST` is contention, and an interrupted create can never leave a
+ * lock whose record is missing or cut short — a state no takeover can prove dead, which therefore
+ * stalls every later writer of the same file.
+ */
+async function createLock(lockPath: string): Promise<void> {
+  const temp = `${lockPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
+  await writeFile(temp, `${process.pid}\n`, { mode: 0o600, flag: 'wx' })
+  try {
+    await link(temp, lockPath)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code
+    // Filesystems without hard links (exFAT, some network shares) keep exclusivity via an exclusive copy.
+    if (code !== 'EPERM' && code !== 'ENOSYS' && code !== 'EXDEV') throw error
+    await copyFile(temp, lockPath, constants.COPYFILE_EXCL)
+  } finally {
+    await rm(temp, { force: true })
   }
 }
 
@@ -123,6 +148,26 @@ function holderExited(record: string): boolean {
   } catch (error) {
     // EPERM means the process exists under another user.
     return (error as NodeJS.ErrnoException).code === 'ESRCH'
+  }
+}
+
+/**
+ * How long a lock record that is not a PID must stay untouched before takeover may treat its writer
+ * as gone. A live creator commits its record within microseconds of the exclusive create, so a record
+ * nobody has modified for this long belongs to a creator that died in between — the shape left behind
+ * when the record write itself failed, which no PID probe can ever resolve.
+ */
+const UNWRITTEN_LOCK_GRACE_MS = 10_000
+
+/** Whether the lock's recorded holder is proven gone, including a create that never committed its record. */
+async function holderIsGone(lockPath: string, record: string): Promise<boolean> {
+  if (/^\d+\n$/.test(record)) return holderExited(record)
+  try {
+    const stat = await lstat(lockPath)
+    return Date.now() - stat.mtimeMs >= UNWRITTEN_LOCK_GRACE_MS
+  } catch {
+    // A lock that vanished, or that Windows is still deleting, proves nothing about a holder.
+    return false
   }
 }
 
@@ -149,7 +194,7 @@ async function readLockRecord(lockPath: string): Promise<string | undefined> {
  */
 async function takeOverExitedLock(lockPath: string): Promise<boolean> {
   const record = await readLockRecord(lockPath)
-  if (record === undefined || !holderExited(record)) return false
+  if (record === undefined || !(await holderIsGone(lockPath, record))) return false
   const claim = `${lockPath}.takeover-${createHash('sha256').update(record).digest('hex').slice(0, 16)}`
   try {
     await writeFile(claim, `${process.pid}\n`, { mode: 0o600, flag: 'wx' })
@@ -160,7 +205,7 @@ async function takeOverExitedLock(lockPath: string): Promise<boolean> {
     throw error
   }
   try {
-    if (await readLockRecord(lockPath) !== record || !holderExited(record)) return false
+    if (await readLockRecord(lockPath) !== record || !(await holderIsGone(lockPath, record))) return false
     try {
       await rm(lockPath, { force: true })
     } catch (error) {
@@ -213,16 +258,18 @@ export interface FileLockOptions {
 
 /**
  * Hold the cross-process writer lock for `filename` around one operation. The
- * lock is a `wx`-created sibling (`<filename>.lock`); paired with the
- * rename-based commit of {@link writeFileAtomic}, readers stay lock-free and
- * only writers contend. `EEXIST` is contention directly; an `EPERM` is
+ * lock is a `link`-published sibling (`<filename>.lock`) whose `<pid>\n` record is committed
+ * before the lock path exists; paired with the rename-based commit of {@link writeFileAtomic},
+ * readers stay lock-free and only writers contend. `EEXIST` is contention directly; an `EPERM` is
  * contention only when a fresh `lstat` confirms the lock path exists, covering
  * Windows exclusive-create behavior. Windows retries one unconfirmed EPERM
  * because the holder can release before the probe; a repeated unconfirmed
  * permission error is rethrown. The lock records its holder's PID. A contender
  * removes the lock and retries at once when no process with that PID exists
  * (`ESRCH`); any other lock, including one whose holder exists under another
- * user (`EPERM`) or whose record is incomplete, is waited for. Contention backs
+ * user (`EPERM`), is waited for; a record that is not a PID is taken over only after it has been
+ * left untouched for {@link UNWRITTEN_LOCK_GRACE_MS}, because a live creator commits its record at
+ * once. Contention backs
  * off exponentially and times out after the deadline. A holder whose PID a
  * live process reused keeps its lock until an operator removes it. Takeover
  * proves only that the recorded process exited: an operation that starts other
@@ -247,7 +294,7 @@ export async function withFileLock<T>(
   for (;;) {
     options?.signal?.throwIfAborted()
     try {
-      await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600, flag: 'wx' })
+      await createLock(lockPath)
       break
     } catch (error) {
       if (!await isLockContention(error, lockPath)) {
